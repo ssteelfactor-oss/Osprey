@@ -140,6 +140,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="code\main.c" />
+    <ClCompile Include="code\sweep.c" />
+    <ClCompile Include="code\epm.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\osprey.h" />

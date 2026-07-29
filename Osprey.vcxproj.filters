@@ -18,6 +18,9 @@
     <ClCompile Include="code\main.c">
       <Filter>Исходные файлы</Filter>
     </ClCompile>
+    <ClCompile Include="code\sweep.c">
+      <Filter>Исходные файлы</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\osprey.h">

@@ -1,21 +1,19 @@
 /*
- * sweep.c — v0.1
- * Tier-0 liveness harness for Osprey.
+ * sweep.c — v0.2
+ * Tier-0 target expansion + generic lock-free worker pool for Osprey.
  *
  * Concurrency model (the load-bearing part of any sweep):
- *   - I/O-bound work: a worker blocked in a socket wait is off the run queue
- *     and costs ~nothing, so worker count is decoupled from core count.
+ *   - I/O-bound work: a worker blocked in a socket/RPC wait is off the run
+ *     queue and costs ~nothing, so worker count is decoupled from core count.
  *   - Lock-free distribution: a fixed target array + one InterlockedIncrement
  *     dispenser hands each worker a unique index; the survivors drain the
  *     array even if some CreateThread calls fail.
- *   - Lock-free results: each worker writes only the slot it owns.
- *   - The per-target timeout is the primary tuning knob: without it one dead
- *     host stalls a worker for the full TCP SYN timeout (~21s).
+ *   - Lock-free results: each worker touches only the slot it owns.
+ *   - The per-target timeout is the primary tuning knob.
  *
- * The collector is OsProbeEpm — a bare TCP/135 reachability test, the
- * loudest-but-harmless probe: it activates nothing and invokes no RPC. When
- * epm.c lands this becomes a function-pointer seam so richer Tier-0 collectors
- * (ept_lookup, ServerAlive2) reuse this exact pool unchanged.
+ * The pool is generic: OspreyRun drives any OSPREY_COLLECTOR over the target
+ * set. OsProbeEpm (bare TCP/135 liveness) is just the first collector; epm.c
+ * rides the same pool. OspreySweep is the liveness convenience wrapper.
  */
 
 #include "../include/osprey.h"
@@ -23,13 +21,15 @@
 #define OSPREY_EPM_PORT   135
 
 typedef struct _OS_SWEEP_CTX {
-    OSPREY_TARGETS *pSet;
-    volatile LONG   lNext;      /* atomic work dispenser (index) */
-    DWORD           dwTimeoutMs;
+    OSPREY_TARGETS  *pSet;
+    volatile LONG    lNext;         /* atomic work dispenser (index) */
+    DWORD            dwTimeoutMs;
+    OSPREY_COLLECTOR pfnCollector;
+    PVOID            pvUser;
 } OS_SWEEP_CTX;
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Collector — non-blocking connect to TCP/135 with an explicit timeout       */
+/*  Liveness collector — non-blocking connect to TCP/135 with a timeout        */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 _Must_inspect_result_
@@ -79,8 +79,8 @@ OsProbeEpm(
         } else if (FD_ISSET(sock, &ExceptSet)) {
             State = OSPREY_HOST_REFUSED;                /* typically RST */
         } else {
-            int iErr   = 0;
-            int cbErr  = (int)sizeof(iErr);
+            int iErr  = 0;
+            int cbErr = (int)sizeof(iErr);
             getsockopt(sock, SOL_SOCKET, SO_ERROR, (char *)&iErr, &cbErr);
             State = (iErr == 0) ? OSPREY_HOST_ALIVE : OSPREY_HOST_REFUSED;
         }
@@ -88,6 +88,19 @@ OsProbeEpm(
 
     closesocket(sock);
     return State;
+}
+
+/* Collector wrapper: the pool's per-target callback for liveness. */
+static VOID
+OsCollectLiveness(
+    _In_        LONG            iTarget,
+    _Inout_     OSPREY_TARGETS *pSet,
+    _In_        DWORD           dwTimeoutMs,
+    _Inout_opt_ PVOID           pvUser)
+{
+    UNREFERENCED_PARAMETER(pvUser);
+    pSet->pTargets[iTarget].State =
+        OsProbeEpm(pSet->pTargets[iTarget].ulAddr, dwTimeoutMs);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -105,8 +118,7 @@ OsWorker(
         iTarget = InterlockedIncrement(&pCtx->lNext) - 1;
         if (iTarget >= pCtx->pSet->cTargets)
             break;
-        pCtx->pSet->pTargets[iTarget].State =
-            OsProbeEpm(pCtx->pSet->pTargets[iTarget].ulAddr, pCtx->dwTimeoutMs);
+        pCtx->pfnCollector(iTarget, pCtx->pSet, pCtx->dwTimeoutMs, pCtx->pvUser);
     }
     return 0;
 }
@@ -178,30 +190,34 @@ OspreyTargetsFree(
 }
 
 VOID
-OspreySweep(
-    _Inout_ OSPREY_TARGETS *pTargets,
-    _In_    DWORD           dwWorkers,
-    _In_    DWORD           dwTimeoutMs)
+OspreyRun(
+    _Inout_     OSPREY_TARGETS  *pTargets,
+    _In_        DWORD            dwWorkers,
+    _In_        DWORD            dwTimeoutMs,
+    _In_        OSPREY_COLLECTOR pfnCollector,
+    _Inout_opt_ PVOID            pvUser)
 {
     OS_SWEEP_CTX ctx;
     HANDLE      *pThreads;
     DWORD        w;
 
-    if (!pTargets || pTargets->cTargets <= 0)
+    if (!pTargets || pTargets->cTargets <= 0 || !pfnCollector)
         return;
     if (dwWorkers < 1)
         dwWorkers = 1;
     if ((LONG)dwWorkers > pTargets->cTargets)
         dwWorkers = (DWORD)pTargets->cTargets;
 
-    ctx.pSet        = pTargets;
-    ctx.lNext       = 0;
-    ctx.dwTimeoutMs = dwTimeoutMs;
+    ctx.pSet         = pTargets;
+    ctx.lNext        = 0;
+    ctx.dwTimeoutMs  = dwTimeoutMs;
+    ctx.pfnCollector = pfnCollector;
+    ctx.pvUser       = pvUser;
 
     pThreads = (HANDLE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                    (SIZE_T)dwWorkers * sizeof(HANDLE));
     if (!pThreads) {
-        OsWorker(&ctx);         /* degenerate: sweep on this thread rather than not at all */
+        OsWorker(&ctx);         /* degenerate: run on this thread rather than not at all */
         return;
     }
 
@@ -218,4 +234,13 @@ OspreySweep(
     }
 
     HeapFree(GetProcessHeap(), 0, pThreads);
+}
+
+VOID
+OspreySweep(
+    _Inout_ OSPREY_TARGETS *pTargets,
+    _In_    DWORD           dwWorkers,
+    _In_    DWORD           dwTimeoutMs)
+{
+    OspreyRun(pTargets, dwWorkers, dwTimeoutMs, OsCollectLiveness, NULL);
 }
