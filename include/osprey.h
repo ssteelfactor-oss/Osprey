@@ -14,9 +14,12 @@
  *   opt-in probe layer over a narrowed target set.
  *
  * Module map:
- *   main.c   — v0.1  entry point / dispatch
- *   sweep.c  — v0.1  Tier-0 CIDR expansion + lock-free liveness pool
- *   epm.c    — v0.2  Tier-0 endpoint-mapper enumeration (ept_lookup)
+ *   main.c     — v0.1  entry point / dispatch
+ *   sweep.c    — v0.1  Tier-0 CIDR expansion + lock-free liveness pool
+ *   epm.c      — v0.2  Tier-0 endpoint-mapper enumeration (ept_lookup)
+ *   oxid.c     — v0.3  Tier-0 IObjectExporter::ServerAlive2 (binding leak)
+ *   registry.c — v0.4  Tier-1 remote-registry transport (MS-RRP)
+ *   posture.c  — v0.4  Tier-1 DCOM authentication / hardening posture (plan D)
  */
 
 #pragma once
@@ -43,7 +46,7 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "rpcrt4.lib")
 
-#define OSPREY_VERSION L"0.2"
+#define OSPREY_VERSION L"0.4"
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Collection tier — how a fact was obtained, from most reachable to most
@@ -92,30 +95,24 @@ typedef struct _OSPREY_TARGETS {
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 /* A per-target collector. The pool hands each worker a unique index and this
- * callback; the callback owns all semantics for that target (read ulAddr,
- * write State, and stash richer per-target output through pvUser — the same
- * index it was handed). This is the seam every Tier-0 collector rides on. */
+ * callback; the callback owns all semantics for that target. The seam every
+ * Tier-0 and Tier-1 collector rides on. */
 typedef VOID (*OSPREY_COLLECTOR)(
     _In_        LONG            iTarget,
     _Inout_     OSPREY_TARGETS *pSet,
     _In_        DWORD           dwTimeoutMs,
     _Inout_opt_ PVOID           pvUser);
 
-/* Expand L"a.b.c.d/prefix" (/16..32) into a target set. The caller releases
- * the set with OspreyTargetsFree. */
 _Must_inspect_result_
 HRESULT
 OspreyParseCidr(
     _In_z_ LPCWSTR         pwszCidr,
     _Out_  OSPREY_TARGETS *pTargets);
 
-/* Release a target set produced by OspreyParseCidr. Safe on a zeroed struct. */
 VOID
 OspreyTargetsFree(
     _Inout_ OSPREY_TARGETS *pTargets);
 
-/* Run pfnCollector across every target on a lock-free worker pool.
- * dwWorkers is clamped to [1, cTargets]; dwTimeoutMs is the per-target budget. */
 VOID
 OspreyRun(
     _Inout_     OSPREY_TARGETS  *pTargets,
@@ -124,38 +121,37 @@ OspreyRun(
     _In_        OSPREY_COLLECTOR pfnCollector,
     _Inout_opt_ PVOID            pvUser);
 
-/* Convenience: the Tier-0 liveness collector (TCP/135), filling each State. */
 VOID
 OspreySweep(
     _Inout_ OSPREY_TARGETS *pTargets,
     _In_    DWORD           dwWorkers,
     _In_    DWORD           dwTimeoutMs);
 
+/* Format a target's IPv4 (network byte order) as text. Shared utility. */
+VOID
+OspreyFormatIp(
+    _In_                   ULONG  ulAddrNbo,
+    _Out_writes_z_(cchBuf) LPWSTR pwszBuf,
+    _In_                   SIZE_T cchBuf);
+
 /* ─────────────────────────────────────────────────────────────────────────── */
 /*  epm.c — Tier-0 endpoint-mapper enumeration                                 */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
-/* One endpoint-mapper registration on a host: an interface bound to a
- * concrete endpoint, optionally annotated by the server. */
 typedef struct _OSPREY_EPM_ELT {
-    UUID   IfId;                 /* interface UUID                         */
+    UUID   IfId;
     USHORT usVerMajor;
     USHORT usVerMinor;
-    WCHAR  wszBinding[256];      /* resolved endpoint (proto:addr[endpoint]) */
-    WCHAR  wszAnnotation[64];    /* server-supplied annotation, if any     */
+    WCHAR  wszBinding[256];
+    WCHAR  wszAnnotation[64];
 } OSPREY_EPM_ELT;
 
-/* Per-host EPM inventory. Status records why an inquiry yielded nothing
- * (unreachable, access denied, or simply no more entries = RPC_S_OK). */
 typedef struct _OSPREY_EPM_HOST {
     OSPREY_EPM_ELT *pElts;
     DWORD           cElts;
     RPC_STATUS      Status;
 } OSPREY_EPM_HOST;
 
-/* Enumerate the endpoint mapper on every target a prior sweep marked ALIVE.
- * Allocates a per-target array parallel to pTargets (index-aligned); the
- * caller releases it with OspreyEpmFree. Dead targets get an empty host. */
 _Must_inspect_result_
 HRESULT
 OspreyEnumEpm(
@@ -169,9 +165,112 @@ OspreyEpmFree(
     _Inout_ OSPREY_EPM_HOST **ppHosts,
     _In_    LONG              cHosts);
 
-/* Format a UUID as the canonical 8-4-4-4-12 hex string. Shared utility. */
 VOID
 OspreyFormatUuid(
     _In_                   const UUID *pId,
     _Out_writes_z_(cchBuf) LPWSTR      pwszBuf,
     _In_                   SIZE_T       cchBuf);
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  oxid.c — Tier-0 IObjectExporter::ServerAlive2 (self-advertised bindings)   */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+typedef struct _OSPREY_OXID_BINDING {
+    USHORT usTowerId;
+    WCHAR  wszAddr[256];
+} OSPREY_OXID_BINDING;
+
+typedef struct _OSPREY_OXID_HOST {
+    OSPREY_OXID_BINDING *pBindings;
+    DWORD                cBindings;
+    USHORT               usComVerMajor;
+    USHORT               usComVerMinor;
+    HRESULT              hrResult;
+} OSPREY_OXID_HOST;
+
+_Must_inspect_result_
+HRESULT
+OspreyEnumOxid(
+    _Inout_  OSPREY_TARGETS    *pTargets,
+    _In_     DWORD              dwWorkers,
+    _In_     DWORD              dwTimeoutMs,
+    _Outptr_ OSPREY_OXID_HOST **ppHosts);
+
+VOID
+OspreyOxidFree(
+    _Inout_ OSPREY_OXID_HOST **ppHosts,
+    _In_    LONG               cHosts);
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  registry.c — Tier-1 remote-registry transport (MS-RRP / RemoteRegistry)    */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+/* Open a host's HKLM over the network under the caller's credentials. On
+ * success returns S_OK and an HKEY the caller closes with RegCloseKey; on
+ * failure a mapped HRESULT (RemoteRegistry off, unreachable, access denied). */
+_Must_inspect_result_
+HRESULT
+OspreyRegConnectHklm(
+    _In_z_ LPCWSTR pwszHost,        /* bare L"a.b.c.d" — no leading backslashes */
+    _Out_  PHKEY   phRemote);
+
+/* Read a REG_SZ / REG_EXPAND_SZ value at hKey\pwszSubkey (pwszSubkey may be
+ * L"" for hKey itself). Result is always NUL-terminated. */
+_Must_inspect_result_
+HRESULT
+OspreyRegReadStr(
+    _In_                   HKEY    hKey,
+    _In_z_                 LPCWSTR pwszSubkey,
+    _In_z_                 LPCWSTR pwszValue,
+    _Out_writes_z_(cchBuf) LPWSTR  pwszBuf,
+    _In_                   DWORD   cchBuf);
+
+/* Read a REG_DWORD value. */
+_Must_inspect_result_
+HRESULT
+OspreyRegReadDword(
+    _In_   HKEY    hKey,
+    _In_z_ LPCWSTR pwszSubkey,
+    _In_z_ LPCWSTR pwszValue,
+    _Out_  DWORD  *pdwValue);
+
+/* Read a REG_BINARY value into a HeapAlloc'd buffer (e.g. a self-relative
+ * SECURITY_DESCRIPTOR). Caller frees with HeapFree(GetProcessHeap(), 0, ...). */
+_Must_inspect_result_
+HRESULT
+OspreyRegReadBinary(
+    _In_     HKEY    hKey,
+    _In_z_   LPCWSTR pwszSubkey,
+    _In_z_   LPCWSTR pwszValue,
+    _Outptr_result_bytebuffer_(*pcbData) PBYTE *ppbData,
+    _Out_    DWORD  *pcbData);
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  posture.c — Tier-1 DCOM authentication / hardening posture (plan D)        */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+/* Machine-wide DCOM posture from HKLM\SOFTWARE\Microsoft\Ole (+ AppCompat).
+ * bHave* flags mark which values were actually present. */
+typedef struct _OSPREY_POSTURE_HOST {
+    BOOL    bEnableDcom;             /* EnableDCOM == "Y"                       */
+    BOOL    bHaveEnableDcom;
+    DWORD   dwLegacyAuthLevel;       /* LegacyAuthenticationLevel (RPC_C_AUTHN_LEVEL_*) */
+    BOOL    bHaveLegacyAuth;
+    DWORD   dwLegacyImpLevel;        /* LegacyImpersonationLevel                */
+    BOOL    bHaveLegacyImp;
+    DWORD   dwRequireIntegrity;      /* Ole\AppCompat\RequireIntegrityActivationAuthenticationLevel (2021-23 hardening) */
+    BOOL    bHaveRequireIntegrity;
+    HRESULT hrResult;                /* transport status (S_OK if Ole opened)   */
+} OSPREY_POSTURE_HOST;
+
+_Must_inspect_result_
+HRESULT
+OspreyEnumPosture(
+    _Inout_  OSPREY_TARGETS       *pTargets,
+    _In_     DWORD                 dwWorkers,
+    _In_     DWORD                 dwTimeoutMs,
+    _Outptr_ OSPREY_POSTURE_HOST **ppHosts);
+
+VOID
+OspreyPostureFree(
+    _Inout_ OSPREY_POSTURE_HOST **ppHosts);

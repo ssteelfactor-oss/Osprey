@@ -236,6 +236,21 @@ OspreyRun(
     HeapFree(GetProcessHeap(), 0, pThreads);
 }
 
+/* Format an IPv4 (network byte order) as dotted-decimal text. */
+VOID
+OspreyFormatIp(
+    _In_                   ULONG  ulAddrNbo,
+    _Out_writes_z_(cchBuf) LPWSTR pwszBuf,
+    _In_                   SIZE_T cchBuf)
+{
+    struct in_addr addr;
+    if (cchBuf == 0)
+        return;
+    addr.s_addr = ulAddrNbo;
+    if (!InetNtopW(AF_INET, &addr, pwszBuf, cchBuf))
+        pwszBuf[0] = L'\0';
+}
+
 VOID
 OspreySweep(
     _Inout_ OSPREY_TARGETS *pTargets,
