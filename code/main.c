@@ -1,5 +1,5 @@
 /*
- * main.c — v0.4
+ * main.c — v0.5
  * Osprey entry point.
  *
  * Tier-0 (unprivileged, remote):
@@ -8,9 +8,7 @@
  *   3. oxid      — which bindings does the host advertise?   (oxid.c)
  * Tier-1 (RemoteRegistry, usually unprivileged):
  *   4. posture   — DCOM auth / hardening posture             (posture.c)
- *
- * As modules land this becomes a dispatch over subcommands, each writing
- * provenance-tagged nodes into a shared model that report.c serialises.
+ *   5. activation— launch/access ACL matrix + RunAs (plan A) (activation.c)
  */
 
 #include "../include/osprey.h"
@@ -32,7 +30,7 @@ OspreyPrintUsage(
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
-/*  Reporting                                                                  */
+/*  Tier-0 reporting                                                           */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
 static VOID
@@ -81,7 +79,10 @@ OspreyPrintOxidHost(
     }
 }
 
-/* Map an RPC_C_AUTHN_LEVEL_* value to a short label. */
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  Tier-1 reporting                                                           */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
 static LPCWSTR
 OspreyAuthLevelName(
     _In_ DWORD dwLevel)
@@ -109,23 +110,111 @@ OspreyPrintPostureHost(
     }
 
     wprintf(L"%-15s  posture:", pwszIp);
-
     if (pHost->bHaveEnableDcom)
         wprintf(L" EnableDCOM=%s", pHost->bEnableDcom ? L"Y" : L"N");
-
     if (pHost->bHaveLegacyAuth)
-        wprintf(L" | LegacyAuth=%lu(%s)%s",
-                pHost->dwLegacyAuthLevel,
+        wprintf(L" | LegacyAuth=%lu(%s)%s", pHost->dwLegacyAuthLevel,
                 OspreyAuthLevelName(pHost->dwLegacyAuthLevel),
                 (pHost->dwLegacyAuthLevel <= 1) ? L" [NO AUTH]" : L"");
-
     if (pHost->bHaveRequireIntegrity)
         wprintf(L" | ActivationHardening=%s",
                 (pHost->dwRequireIntegrity != 0) ? L"enforced" : L"OFF");
     else
         wprintf(L" | ActivationHardening=not-set");
-
     wprintf(L"\n");
+}
+
+/* Compact rights string, e.g. "EXEC EL ER AL AR". */
+static VOID
+OspreyFmtRights(
+    _In_                   const OSPREY_COM_RIGHTS *pR,
+    _Out_writes_z_(cchBuf) LPWSTR                   pwszBuf,
+    _In_                   SIZE_T                    cchBuf)
+{
+    pwszBuf[0] = L'\0';
+    if (pR->bExecute)        (VOID)StringCchCatW(pwszBuf, cchBuf, L"EXEC ");
+    if (pR->bExecuteLocal)   (VOID)StringCchCatW(pwszBuf, cchBuf, L"EL ");
+    if (pR->bExecuteRemote)  (VOID)StringCchCatW(pwszBuf, cchBuf, L"ER ");
+    if (pR->bActivateLocal)  (VOID)StringCchCatW(pwszBuf, cchBuf, L"AL ");
+    if (pR->bActivateRemote) (VOID)StringCchCatW(pwszBuf, cchBuf, L"AR ");
+}
+
+/* Broad principal — the ones that make a remote-activate ACE dangerous. */
+static BOOL
+OspreyIsBroadPrincipal(
+    _In_z_ LPCWSTR pwszPrincipal)
+{
+    return (wcsstr(pwszPrincipal, L"Everyone")            != 0 )
+        || (wcsstr(pwszPrincipal, L"Authenticated Users") != 0 )
+        || (wcsstr(pwszPrincipal, L"ANONYMOUS")           != 0 )
+        || (wcscmp(pwszPrincipal, L"S-1-1-0")             == 0)
+        || (wcscmp(pwszPrincipal, L"S-1-5-11")            == 0);
+}
+
+static VOID
+OspreyPrintSd(
+    _In_z_ LPCWSTR              pwszLabel,
+    _In_   const OSPREY_ACT_SD *pSd)
+{
+    DWORD i = 0;
+    WCHAR wszRights[48] = { 0 };
+
+    if (!pSd->bPresent) {
+        wprintf(L"      %s: (machine default)\n", pwszLabel);
+        return;
+    }
+    if (pSd->bNullDacl) {
+        wprintf(L"      %s: NULL DACL  <- EVERYONE, ALL RIGHTS\n", pwszLabel);
+        return;
+    }
+
+    wprintf(L"      %s: %lu ACE(s)\n", pwszLabel, pSd->cAces);
+    for (i = 0; i < pSd->cAces; i++) {
+        BOOL bFlag;
+        OspreyFmtRights(&pSd->pAces[i].Rights, wszRights, ARRAYSIZE(wszRights));
+        bFlag = (!pSd->pAces[i].bDeny)
+             && (pSd->pAces[i].Rights.bActivateRemote || pSd->pAces[i].Rights.bExecuteRemote)
+             && OspreyIsBroadPrincipal(pSd->pAces[i].wszPrincipal);
+        wprintf(L"        %s %-22s %-40s%s\n",
+                pSd->pAces[i].bDeny ? L"DENY " : L"ALLOW",
+                wszRights, pSd->pAces[i].wszPrincipal,
+                bFlag ? L"  <- broad principal, REMOTE" : L"");
+    }
+}
+
+static VOID
+OspreyPrintActHost(
+    _In_z_ LPCWSTR                pwszIp,
+    _In_   const OSPREY_ACT_HOST *pHost)
+{
+    DWORD i = 0;
+
+    if (FAILED(pHost->hrResult)) {
+        wprintf(L"%-15s  activation: unavailable (0x%08lX)\n",
+                pwszIp, (unsigned long)pHost->hrResult);
+        return;
+    }
+
+    wprintf(L"\n%-15s  activation: %lu AppID(s) with explicit ACL/RunAs\n",
+            pwszIp, pHost->cAppIds);
+
+    if (pHost->DefaultLaunch.bNullDacl || pHost->DefaultAccess.bNullDacl)
+        wprintf(L"      machine default: NULL DACL present  <- permissive baseline\n");
+
+    for (i = 0; i < pHost->cAppIds; i++) {
+        const OSPREY_ACT_APPID *pApp = &pHost->pAppIds[i];
+
+        wprintf(L"    %s  %s%s%s\n",
+                pApp->wszAppId,
+                (pApp->wszName[0]) ? pApp->wszName : L"",
+                pApp->bHaveRunAs ? L"  RunAs=" : L"",
+                pApp->bHaveRunAs ? pApp->wszRunAs : L"");
+
+        if (pApp->Launch.bPresent || pApp->Launch.bNullDacl)
+            OspreyPrintSd(L"launch", &pApp->Launch);
+        if (pApp->Access.bPresent || pApp->Access.bNullDacl)
+            OspreyPrintSd(L"access", &pApp->Access);
+    }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -136,14 +225,15 @@ int
 wmain(int argc, wchar_t *argv[])
 {
     WSADATA              wsa;
-    OSPREY_TARGETS       Targets = { NULL, 0 };
-    OSPREY_EPM_HOST     *pEpm     = NULL;
-    OSPREY_OXID_HOST    *pOxid    = NULL;
-    OSPREY_POSTURE_HOST *pPosture = NULL;
-    DWORD                dwWorkers, dwTimeoutMs;
-    ULONGLONG            ullT0, ullDelta;
-    LONG                 i, cAlive = 0;
-    WCHAR                wszIp[INET_ADDRSTRLEN];
+    OSPREY_TARGETS       Targets = { 0, 0 };
+    OSPREY_EPM_HOST     *pEpm     = 0;
+    OSPREY_OXID_HOST    *pOxid    = 0;
+    OSPREY_POSTURE_HOST *pPosture = 0;
+    OSPREY_ACT_HOST     *pAct     = 0;
+    DWORD                dwWorkers = 0, dwTimeoutMs = 0;
+    ULONGLONG            ullT0 = 0, ullDelta = 0;
+    LONG                 i = 0, cAlive = 0;
+    WCHAR                wszIp[INET_ADDRSTRLEN] = { 0 };
 
     if (argc < 2) {
         OspreyPrintUsage(argv[0]);
@@ -213,6 +303,19 @@ wmain(int argc, wchar_t *argv[])
             }
         }
         OspreyPostureFree(&pPosture);
+    }
+
+    /* Stage 5 — activation ACL matrix + RunAs (Tier-1, plan A). */
+    if (SUCCEEDED(OspreyEnumActivation(&Targets, dwWorkers, dwTimeoutMs, &pAct))) {
+        wprintf(L"\n─── activation matrix (Tier-1, plan A) ───\n");
+        wprintf(L"    legend: EXEC=execute  EL/ER=execute local/remote  AL/AR=activate local/remote\n");
+        for (i = 0; i < Targets.cTargets; i++) {
+            if (Targets.pTargets[i].State == OSPREY_HOST_ALIVE) {
+                OspreyFormatIp(Targets.pTargets[i].ulAddr, wszIp, ARRAYSIZE(wszIp));
+                OspreyPrintActHost(wszIp, &pAct[i]);
+            }
+        }
+        OspreyActivationFree(&pAct, Targets.cTargets);
     }
 
 cleanup:

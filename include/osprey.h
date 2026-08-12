@@ -20,6 +20,7 @@
  *   oxid.c     — v0.3  Tier-0 IObjectExporter::ServerAlive2 (binding leak)
  *   registry.c — v0.4  Tier-1 remote-registry transport (MS-RRP)
  *   posture.c  — v0.4  Tier-1 DCOM authentication / hardening posture (plan D)
+ *   activation.c — v0.5 Tier-1 DCOM activation/access ACL matrix (plan A)
  */
 
 #pragma once
@@ -40,13 +41,14 @@
 #include <stdint.h>
 #include <wchar.h>
 #include <strsafe.h>
+#include <sddl.h>
 #include <sal.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "rpcrt4.lib")
 
-#define OSPREY_VERSION L"0.4"
+#define OSPREY_VERSION L"0.5"
 
 /* ════════════════════════════════════════════════════════════════════════════
  * Collection tier — how a fact was obtained, from most reachable to most
@@ -274,3 +276,66 @@ OspreyEnumPosture(
 VOID
 OspreyPostureFree(
     _Inout_ OSPREY_POSTURE_HOST **ppHosts);
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  activation.c — Tier-1 DCOM activation/access ACL matrix (plan A)            */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+/* The five COM launch/access rights an ACE may grant or deny. */
+typedef struct _OSPREY_COM_RIGHTS {
+    BOOL bExecute;          /* COM_RIGHTS_EXECUTE         0x01 */
+    BOOL bExecuteLocal;     /* COM_RIGHTS_EXECUTE_LOCAL   0x02 */
+    BOOL bExecuteRemote;    /* COM_RIGHTS_EXECUTE_REMOTE  0x04 */
+    BOOL bActivateLocal;    /* COM_RIGHTS_ACTIVATE_LOCAL  0x08 */
+    BOOL bActivateRemote;   /* COM_RIGHTS_ACTIVATE_REMOTE 0x10 */
+} OSPREY_COM_RIGHTS;
+
+/* One resolved ACE: principal, allow/deny, decoded rights. */
+typedef struct _OSPREY_ACT_ACE {
+    WCHAR             wszPrincipal[256];   /* DOMAIN\Name, or SID string */
+    BOOL              bDeny;
+    OSPREY_COM_RIGHTS Rights;
+} OSPREY_ACT_ACE;
+
+/* A parsed launch- or access-permission descriptor. */
+typedef struct _OSPREY_ACT_SD {
+    BOOL            bPresent;    /* value existed (else machine default applies) */
+    BOOL            bNullDacl;   /* NULL DACL — everyone, everything             */
+    OSPREY_ACT_ACE *pAces;
+    DWORD           cAces;
+} OSPREY_ACT_SD;
+
+/* One AppID's activation posture. */
+typedef struct _OSPREY_ACT_APPID {
+    WCHAR         wszAppId[64];
+    WCHAR         wszName[128];
+    WCHAR         wszRunAs[128];
+    BOOL          bHaveRunAs;
+    OSPREY_ACT_SD Launch;
+    OSPREY_ACT_SD Access;
+} OSPREY_ACT_APPID;
+
+/* Per-host activation inventory: machine-wide defaults/restrictions + AppIDs
+ * that carry an explicit ACL or RunAs (defaulted AppIDs are omitted). */
+typedef struct _OSPREY_ACT_HOST {
+    OSPREY_ACT_APPID *pAppIds;
+    DWORD             cAppIds;
+    OSPREY_ACT_SD     DefaultLaunch;
+    OSPREY_ACT_SD     DefaultAccess;
+    OSPREY_ACT_SD     MachineLaunchRestriction;
+    OSPREY_ACT_SD     MachineAccessRestriction;
+    HRESULT           hrResult;
+} OSPREY_ACT_HOST;
+
+_Must_inspect_result_
+HRESULT
+OspreyEnumActivation(
+    _Inout_  OSPREY_TARGETS   *pTargets,
+    _In_     DWORD             dwWorkers,
+    _In_     DWORD             dwTimeoutMs,
+    _Outptr_ OSPREY_ACT_HOST **ppHosts);
+
+VOID
+OspreyActivationFree(
+    _Inout_ OSPREY_ACT_HOST **ppHosts,
+    _In_    LONG              cHosts);
